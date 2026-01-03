@@ -1,0 +1,22 @@
+# dependencies / caches
+node_modules
+.expo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local tooling
+.vscode
+.DS_Store
+.git
+.gitignore
+
+# native build output (if present)
+android/.gradle
+android/app/build
+ios/build
+
+# anything not needed for mobile build
+../backend
+backend
+**/*.zip
