@@ -6,18 +6,17 @@
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
-
     "icon": "./assets/images/icon.png",
-
     "scheme": "musicophilemobile",
-
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.anonymous.musicophilemobile"
+      "bundleIdentifier": "com.YOURNAME.musicophile",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
-
     "android": {
-      "package": "com.anonymous.musicophilemobile",
+      "package": "com.YOURNAME.musicophile",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/android-icon-foreground.png",
         "backgroundColor": "#0b0b0b"
@@ -25,12 +24,10 @@
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false
     },
-
     "web": {
       "output": "static",
       "favicon": "./assets/images/favicon.png"
     },
-
     "plugins": [
       "expo-router",
       [
@@ -45,10 +42,15 @@
         }
       ]
     ],
-
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "ee6e841b-bd09-485c-9441-678b2f775272"
+      }
     }
   }
 }

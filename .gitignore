@@ -12,8 +12,6 @@ __pycache__/
 # Secrets
 .env
 
-# Musicophile Mobile
-musicophile-mobile/
 
 # Jupyter
 .ipynb_checkpoints/
