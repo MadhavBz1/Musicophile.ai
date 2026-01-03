@@ -5,26 +5,26 @@ import json
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, Query, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from sklearn.metrics.pairwise import cosine_similarity  # still used as fallback (optional)
-from scipy import sparse
+
 import joblib
 
-print("✅ RUNNING FAISS ARTIFACT BACKEND:", __file__)
+print("✅ RUNNING MUSICOPHILE BACKEND (FAISS + TFIDF/SVD LYRICS):", __file__)
 
 # ---------------- Config ----------------
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Render Persistent Disk: set MUSICOPHILE_ARTIFACTS=/data/artifacts
-# Local default: backend/artifacts
-ART_DIR = os.environ.get("MUSICOPHILE_ARTIFACTS", os.path.join(HERE, "artifacts"))
+# Prefer Render persistent disk if present, else fall back to local repo artifacts
+DEFAULT_ART_DIR_RENDER = "/data/artifacts"
+DEFAULT_ART_DIR_LOCAL = os.path.join(HERE, "artifacts")
 
-# Load at startup?
-EAGER_LOAD = os.environ.get("MUSICOPHILE_EAGER_LOAD", "true").strip().lower() in ("1", "true", "yes", "y")
+ART_DIR = os.environ.get(
+    "MUSICOPHILE_ARTIFACTS",
+    DEFAULT_ART_DIR_RENDER if os.path.isdir(DEFAULT_ART_DIR_RENDER) else DEFAULT_ART_DIR_LOCAL,
+)
 
-# CORS
 ORIGINS_ENV = os.environ.get("MUSICOPHILE_ORIGINS", "")
 if ORIGINS_ENV.strip():
     ALLOW_ORIGINS = [o.strip() for o in ORIGINS_ENV.split(",") if o.strip()]
@@ -38,7 +38,7 @@ else:
         "http://127.0.0.1:3000",
     ]
 
-app = FastAPI(title="musicophile.ai API (FAISS + TFIDF Lyrics)")
+app = FastAPI(title="musicophile.ai API (FAISS + TFIDF/SVD Lyrics)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS,
@@ -47,21 +47,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- Globals ----------------
+# ---------------- Globals (loaded artifacts) ----------------
 df: pd.DataFrame | None = None
 X_audio: np.ndarray | None = None      # (N, da), normalized float32
 X_meta: np.ndarray | None = None       # (N, dm), normalized float32
 X_stage1: np.ndarray | None = None     # (N, d1), normalized float32
 faiss_index = None
+
+tfidf = None
+svd = None
+
 meta_info: dict = {}
-
-# Lyrics models (small, safe)
-tfidf_model = None
-svd_model = None
-lyrics_col: str | None = None
-
-# Optional cache for seed lyric vectors (speeds repeated requests)
-_seed_lyrics_cache: dict[int, np.ndarray] = {}
 
 # ---------------- Utils ----------------
 def _norm(s: str) -> str:
@@ -80,173 +76,124 @@ def _build_text_signals(series_norm: pd.Series, qn: str):
     any_contains = series_norm.str.contains(q_esc, regex=True, na=False)
     return exact, starts, word_contains, any_contains
 
-def _missing(path: str) -> str:
-    return f"Missing required artifact: {path}"
-
-def _pick_lyrics_column(frame: pd.DataFrame) -> str | None:
-    """
-    Try to detect the lyrics text column name.
-    Common possibilities: 'lyrics', 'Lyrics', 'lyric', 'text', etc.
-    """
-    candidates = ["lyrics", "Lyrics", "lyric", "Lyric", "text", "Text", "clean_lyrics", "Clean Lyrics"]
-    for c in candidates:
-        if c in frame.columns:
-            return c
-
-    # Heuristic: any column containing 'lyric'
-    for c in frame.columns:
-        if "lyric" in str(c).lower():
-            return c
-
-    return None
-
 def _l2_normalize_rows(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    # X: (n, d)
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms = np.maximum(norms, eps)
     return X / norms
 
-def _l2_normalize_vec(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    if n < eps:
-        return v
-    return v / n
+def _pick_lyrics_column(frame: pd.DataFrame) -> str | None:
+    if "lyrics_clean" in frame.columns:
+        return "lyrics_clean"
+    if "lyrics" in frame.columns:
+        return "lyrics"
+    return None
 
-def ensure_loaded(force: bool = False):
-    global df, X_audio, X_meta, X_stage1, faiss_index, meta_info
-    global tfidf_model, svd_model, lyrics_col
+def ensure_loaded():
+    """
+    Loads:
+      - df.parquet
+      - X_audio.npy, X_meta.npy, X_stage1.npy (mmap)
+      - faiss_stage1.index
+      - tfidf.joblib + svd.joblib  (for lyrics similarity on-the-fly)
+    """
+    global df, X_audio, X_meta, X_stage1, faiss_index, tfidf, svd, meta_info
 
-    if not force and df is not None and faiss_index is not None:
+    if df is not None and faiss_index is not None and tfidf is not None and svd is not None:
         return
 
-    if not os.path.exists(ART_DIR):
+    if not os.path.isdir(ART_DIR):
         raise FileNotFoundError(f"Artifacts directory not found: {ART_DIR}")
 
-    # Optional meta.json
     meta_path = os.path.join(ART_DIR, "meta.json")
     if os.path.exists(meta_path):
         with open(meta_path, "r", encoding="utf-8") as f:
             meta_info = json.load(f)
-    else:
-        meta_info = {}
 
-    # Required artifacts
     df_path = os.path.join(ART_DIR, "df.parquet")
     if not os.path.exists(df_path):
-        raise FileNotFoundError(_missing(df_path))
+        raise FileNotFoundError(f"Missing df.parquet at: {df_path}")
     df = pd.read_parquet(df_path)
 
-    # Matrices required
-    audio_path = os.path.join(ART_DIR, "X_audio.npy")
-    meta_mat_path = os.path.join(ART_DIR, "X_meta.npy")
-    stage1_path = os.path.join(ART_DIR, "X_stage1.npy")
-    faiss_path = os.path.join(ART_DIR, "faiss_stage1.index")
+    # Memmap numeric arrays so RAM stays low
+    X_audio_path = os.path.join(ART_DIR, "X_audio.npy")
+    X_meta_path = os.path.join(ART_DIR, "X_meta.npy")
+    X_stage1_path = os.path.join(ART_DIR, "X_stage1.npy")
 
-    for p in (audio_path, meta_mat_path, stage1_path, faiss_path):
+    for p in (X_audio_path, X_meta_path, X_stage1_path):
         if not os.path.exists(p):
-            raise FileNotFoundError(_missing(p))
+            raise FileNotFoundError(f"Missing required artifact: {p}")
 
-    X_audio = np.load(audio_path, mmap_mode="r")
-    X_meta = np.load(meta_mat_path, mmap_mode="r")
-    X_stage1 = np.load(stage1_path, mmap_mode="r")
+    X_audio = np.load(X_audio_path, mmap_mode="r")
+    X_meta = np.load(X_meta_path, mmap_mode="r")
+    X_stage1 = np.load(X_stage1_path, mmap_mode="r")
 
-    # FAISS
+    # TF-IDF + SVD for lyrics (lightweight)
+    tfidf_path = os.path.join(ART_DIR, "tfidf.joblib")
+    svd_path = os.path.join(ART_DIR, "svd.joblib")
+    if not os.path.exists(tfidf_path) or not os.path.exists(svd_path):
+        raise FileNotFoundError(
+            f"Missing tfidf/svd models. Expected:\n- {tfidf_path}\n- {svd_path}"
+        )
+
+    tfidf = joblib.load(tfidf_path)
+    svd = joblib.load(svd_path)
+
+    # FAISS index
     try:
-        import faiss  # noqa: F401
+        import faiss  # type: ignore
     except Exception as e:
         raise RuntimeError(
-            "FAISS failed to import. Ensure requirements include faiss-cpu.\n"
+            "FAISS failed to import. Render Linux should be OK with faiss-cpu.\n"
             f"Original error: {e}"
         )
-    import faiss
-    faiss_index = faiss.read_index(faiss_path)
+    import faiss  # type: ignore
+    index_path = os.path.join(ART_DIR, "faiss_stage1.index")
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(f"Missing faiss index at: {index_path}")
+    faiss_index = faiss.read_index(index_path)
 
-    # Align check
+    # Validate alignment
     n = len(df)
     if X_audio.shape[0] != n or X_meta.shape[0] != n or X_stage1.shape[0] != n:
         raise RuntimeError("Artifact row mismatch: df and matrices are not aligned.")
 
-    # Lyrics via TFIDF + SVD (lightweight)
-    tfidf_path = os.path.join(ART_DIR, "tfidf.joblib")
-    svd_path = os.path.join(ART_DIR, "svd.joblib")
-
-    if os.path.exists(tfidf_path) and os.path.exists(svd_path):
-        tfidf_model = joblib.load(tfidf_path)
-        svd_model = joblib.load(svd_path)
-        lyrics_col = _pick_lyrics_column(df)
-        if lyrics_col is None:
-            print("⚠️ tfidf/svd found, but no lyrics column detected in df; lyrics_sim will be 0.")
-        else:
-            print(f"✅ Lyrics enabled via TFIDF+SVD using df column: {lyrics_col}")
-    else:
-        tfidf_model = None
-        svd_model = None
-        lyrics_col = None
-        print("⚠️ tfidf.joblib/svd.joblib not found; lyrics_sim will be 0.")
-
-    # Clear cache on reload
-    _seed_lyrics_cache.clear()
-
-def lyrics_similarity(seed_idx: int, cand: np.ndarray) -> np.ndarray:
-    """
-    Compute lyrics similarity using tfidf -> svd -> cosine (dot product after L2 normalization).
-    Returns array shape (len(cand),) float32
-    """
-    if df is None or tfidf_model is None or svd_model is None or lyrics_col is None:
-        return np.zeros(len(cand), dtype=np.float32)
-
-    # Seed vector cache
-    if seed_idx in _seed_lyrics_cache:
-        seed_vec = _seed_lyrics_cache[seed_idx]
-    else:
-        seed_text = str(df.at[seed_idx, lyrics_col] if lyrics_col in df.columns else "")
-        seed_tfidf = tfidf_model.transform([seed_text])          # sparse
-        seed_vec = svd_model.transform(seed_tfidf).astype(np.float32)  # (1, d)
-        seed_vec = _l2_normalize_rows(seed_vec)[0]
-        _seed_lyrics_cache[seed_idx] = seed_vec
-
-    # Candidate vectors
-    texts = df.loc[cand, lyrics_col].fillna("").astype(str).tolist()
-    cand_tfidf = tfidf_model.transform(texts)  # sparse
-    cand_vecs = svd_model.transform(cand_tfidf).astype(np.float32)  # (k, d)
-    cand_vecs = _l2_normalize_rows(cand_vecs)
-
-    # cosine similarity = dot product since both normalized
-    sim = cand_vecs @ seed_vec
-    return sim.astype(np.float32)
+    if _pick_lyrics_column(df) is None:
+        print("⚠️ Warning: No lyrics column found (lyrics_clean/lyrics). Lyrics similarity will be 0.")
 
 # ---------------- Schemas ----------------
 class RecommendRequest(BaseModel):
-    seed_id: int = Field(..., description="Row index of the seed song in df")
+    seed_id: int
     w_audio: float = 0.4
     w_lyrics: float = 0.4
     w_meta: float = 0.2
     diversify_genre: float = 0.0
     top_k: int = 10
     k_candidates: int = 2000
+
     artist_mode: str = "different"  # "same" or "different"
 
 # ---------------- Startup ----------------
 @app.on_event("startup")
 def on_startup():
-    if EAGER_LOAD:
-        ensure_loaded()
-        print(f"✅ Loaded artifacts from {ART_DIR}: rows={len(df)} stage1_dim={X_stage1.shape[1]}")
-    else:
-        print("ℹ️ MUSICOPHILE_EAGER_LOAD=false; artifacts will load on first request.")
+    ensure_loaded()
+    print(
+        f"✅ Loaded artifacts from {ART_DIR}: rows={len(df)} "
+        f"stage1_dim={X_stage1.shape[1]} "
+        f"audio_dim={X_audio.shape[1]} meta_dim={X_meta.shape[1]}"
+    )
 
 # ---------------- Routes ----------------
 @app.get("/health")
 def health():
-    ready = df is not None and faiss_index is not None
+    ready = df is not None and faiss_index is not None and tfidf is not None and svd is not None
     return {
         "ok": True,
         "ready": ready,
         "rows": 0 if df is None else int(len(df)),
         "artifacts_dir": ART_DIR,
         "meta": meta_info,
-        "lyrics_mode": "tfidf+svd" if (tfidf_model is not None and svd_model is not None) else "disabled",
-        "lyrics_col": lyrics_col,
-        "eager_load": EAGER_LOAD,
+        "lyrics_mode": "tfidf+svd(on_the_fly)",
     }
 
 @app.get("/search")
@@ -300,6 +247,7 @@ def search(
 
         score = (t_score + a_score).astype(int)
         score = np.where(gate, score, 0)
+
     else:
         a_exact, a_starts, a_word, a_any = _build_text_signals(artist, q_legacy)
         t_exact, t_starts, t_word, t_any = _build_text_signals(song, q_legacy)
@@ -337,18 +285,18 @@ def search(
 def recommend(req: RecommendRequest):
     ensure_loaded()
     if df is None:
-        raise HTTPException(status_code=500, detail="dataset not loaded")
+        return {"error": "dataset not loaded"}
 
-    n_rows = len(df)
+    n = len(df)
     seed_idx = int(req.seed_id)
-    if seed_idx < 0 or seed_idx >= n_rows:
-        raise HTTPException(status_code=400, detail="seed_id out of range")
+    if seed_idx < 0 or seed_idx >= n:
+        return {"error": "seed_id out of range"}
 
     artist_mode = str(req.artist_mode).lower().strip()
     if artist_mode not in ("same", "different"):
-        raise HTTPException(status_code=400, detail="artist_mode must be 'same' or 'different'")
+        return {"error": "artist_mode must be 'same' or 'different'"}
 
-    # Normalize weights
+    # normalize weights
     s = float(req.w_audio + req.w_lyrics + req.w_meta)
     if s <= 0:
         w_audio, w_lyrics, w_meta = 0.4, 0.4, 0.2
@@ -358,16 +306,16 @@ def recommend(req: RecommendRequest):
     # -------- Stage 1: FAISS candidates --------
     k_cand = int(req.k_candidates)
     k_cand = max(k_cand, int(req.top_k) + 50)
-    k_cand = min(k_cand, n_rows)
+    k_cand = min(k_cand, n)
 
     seed_vec = np.asarray(X_stage1[seed_idx], dtype=np.float32).reshape(1, -1)
     D, I = faiss_index.search(seed_vec, k_cand)
     cand = I.ravel().astype(int)
 
-    cand = cand[(cand >= 0) & (cand < n_rows)]
+    cand = cand[(cand >= 0) & (cand < n)]
     cand = cand[cand != seed_idx]
     if cand.size == 0:
-        raise HTTPException(status_code=404, detail="no candidates found")
+        return {"error": "no candidates found"}
 
     # -------- Artist filter --------
     seed_artist = str(df.at[seed_idx, "artist"])
@@ -377,18 +325,35 @@ def recommend(req: RecommendRequest):
         cand = cand[df.loc[cand, "artist"].astype(str).values != seed_artist]
 
     if cand.size == 0:
-        raise HTTPException(status_code=404, detail="no candidates after artist filter")
+        return {"error": "no candidates after artist filter"}
 
     # -------- Stage 2: rerank --------
     seed_audio = np.asarray(X_audio[seed_idx], dtype=np.float32)
     seed_meta = np.asarray(X_meta[seed_idx], dtype=np.float32)
 
-    # since normalized, dot = cosine
+    # audio/meta are assumed normalized so dot = cosine
     audio_sim = np.asarray(X_audio[cand] @ seed_audio, dtype=np.float32)
     meta_sim = np.asarray(X_meta[cand] @ seed_meta, dtype=np.float32)
 
-    # Lyrics sim via TFIDF+SVD
-    lyrics_sim = lyrics_similarity(seed_idx, cand)
+    # Lyrics similarity via TF-IDF -> SVD on-the-fly (seed + candidates only)
+    lyrics_col = _pick_lyrics_column(df)
+    if lyrics_col is None:
+        lyrics_sim = np.zeros(cand.shape[0], dtype=np.float32)
+    else:
+        seed_text = "" if pd.isna(df.at[seed_idx, lyrics_col]) else str(df.at[seed_idx, lyrics_col])
+        cand_texts = df.loc[cand, lyrics_col].fillna("").astype(str).tolist()
+
+        # transform
+        X_seed_tfidf = tfidf.transform([seed_text])
+        X_cand_tfidf = tfidf.transform(cand_texts)
+
+        seed_ly = svd.transform(X_seed_tfidf).astype(np.float32)   # (1, d)
+        cand_ly = svd.transform(X_cand_tfidf).astype(np.float32)   # (k, d)
+
+        # normalize then dot-product
+        seed_ly = _l2_normalize_rows(seed_ly)
+        cand_ly = _l2_normalize_rows(cand_ly)
+        lyrics_sim = (cand_ly @ seed_ly[0]).astype(np.float32)
 
     score = (w_audio * audio_sim) + (w_lyrics * lyrics_sim) + (w_meta * meta_sim)
 
