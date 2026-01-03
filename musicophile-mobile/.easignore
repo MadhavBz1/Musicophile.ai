@@ -11,7 +11,7 @@ yarn-error.log*
 .git
 .gitignore
 
-# generated native folders (these are HUGE)
+# generated native folders (HUGE)
 android
 ios
 
@@ -19,3 +19,12 @@ ios
 ../backend
 backend
 **/*.zip
+
+node_modules/
+node_modules/**
+.expo/
+.expo/**
+android/
+android/**
+ios/
+ios/**
