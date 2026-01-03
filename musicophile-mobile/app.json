@@ -10,13 +10,13 @@
     "scheme": "musicophilemobile",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.YOURNAME.musicophile",
+      "bundleIdentifier": "com.MadhavBezawada.musicophile",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
-      "package": "com.YOURNAME.musicophile",
+      "package": "com.MadhavBezawada.musicophile",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/android-icon-foreground.png",
         "backgroundColor": "#0b0b0b"
