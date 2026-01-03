@@ -11,10 +11,9 @@ yarn-error.log*
 .git
 .gitignore
 
-# native build output (if present)
-android/.gradle
-android/app/build
-ios/build
+# generated native folders (these are HUGE)
+android
+ios
 
 # anything not needed for mobile build
 ../backend
