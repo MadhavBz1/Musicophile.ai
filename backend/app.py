@@ -4,8 +4,9 @@ import re
 import json
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
+
+from fastapi import FastAPI, Query, HTTPException
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy import sparse
@@ -14,12 +15,20 @@ print("✅ RUNNING FAISS ARTIFACT BACKEND:", __file__)
 
 # ---------------- Config ----------------
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# On Render (with Persistent Disk): set MUSICOPHILE_ARTIFACTS=/data/artifacts
+# Locally: defaults to backend/artifacts
 ART_DIR = os.environ.get("MUSICOPHILE_ARTIFACTS", os.path.join(HERE, "artifacts"))
 
+# Optional: control whether artifacts load at startup (recommended True for production)
+EAGER_LOAD = os.environ.get("MUSICOPHILE_EAGER_LOAD", "true").strip().lower() in ("1", "true", "yes", "y")
+
+# CORS
 ORIGINS_ENV = os.environ.get("MUSICOPHILE_ORIGINS", "")
 if ORIGINS_ENV.strip():
     ALLOW_ORIGINS = [o.strip() for o in ORIGINS_ENV.split(",") if o.strip()]
 else:
+    # Reasonable dev defaults; for iOS apps CORS doesn't apply, but web dev/testing may.
     ALLOW_ORIGINS = [
         "http://localhost:8081",
         "http://127.0.0.1:8081",
@@ -45,7 +54,7 @@ X_meta: np.ndarray | None = None       # (N, dm), normalized float32
 X_stage1: np.ndarray | None = None     # (N, d1), normalized float32
 X_lyrics = None                        # sparse CSR (N, V)
 faiss_index = None
-meta_info = {}
+meta_info: dict = {}
 
 # ---------------- Utils ----------------
 def _norm(s: str) -> str:
@@ -64,45 +73,79 @@ def _build_text_signals(series_norm: pd.Series, qn: str):
     any_contains = series_norm.str.contains(q_esc, regex=True, na=False)
     return exact, starts, word_contains, any_contains
 
-def ensure_loaded():
+def _missing(path: str) -> str:
+    return f"Missing required artifact: {path}"
+
+def ensure_loaded(force: bool = False):
+    """
+    Loads artifacts once into memory. Uses ART_DIR which should point to:
+      - Local: backend/artifacts
+      - Render Persistent Disk: /data/artifacts (recommended)
+    """
     global df, X_audio, X_meta, X_stage1, X_lyrics, faiss_index, meta_info
 
-    if df is not None and faiss_index is not None:
+    if not force and df is not None and faiss_index is not None:
         return
 
+    # Validate artifact directory
+    if not os.path.exists(ART_DIR):
+        raise FileNotFoundError(f"Artifacts directory not found: {ART_DIR}")
+
+    # Optional meta.json
     meta_path = os.path.join(ART_DIR, "meta.json")
     if os.path.exists(meta_path):
         with open(meta_path, "r", encoding="utf-8") as f:
             meta_info = json.load(f)
+    else:
+        meta_info = {}
 
+    # Required artifacts
     df_path = os.path.join(ART_DIR, "df.parquet")
     if not os.path.exists(df_path):
-        raise FileNotFoundError(f"Missing df.parquet at: {df_path}")
-
+        raise FileNotFoundError(_missing(df_path))
     df = pd.read_parquet(df_path)
 
-    X_audio = np.load(os.path.join(ART_DIR, "X_audio.npy"), mmap_mode="r")
-    X_meta = np.load(os.path.join(ART_DIR, "X_meta.npy"), mmap_mode="r")
-    X_stage1 = np.load(os.path.join(ART_DIR, "X_stage1.npy"), mmap_mode="r")
-    X_lyrics = sparse.load_npz(os.path.join(ART_DIR, "X_lyrics.npz"))
+    # These are required for recommend()
+    audio_path = os.path.join(ART_DIR, "X_audio.npy")
+    meta_mat_path = os.path.join(ART_DIR, "X_meta.npy")
+    stage1_path = os.path.join(ART_DIR, "X_stage1.npy")
+    lyrics_path = os.path.join(ART_DIR, "X_lyrics.npz")
+    faiss_path = os.path.join(ART_DIR, "faiss_stage1.index")
 
+    for p in (audio_path, meta_mat_path, stage1_path, lyrics_path, faiss_path):
+        if not os.path.exists(p):
+            raise FileNotFoundError(_missing(p))
+
+    X_audio = np.load(audio_path, mmap_mode="r")
+    X_meta = np.load(meta_mat_path, mmap_mode="r")
+    X_stage1 = np.load(stage1_path, mmap_mode="r")
+    X_lyrics = sparse.load_npz(lyrics_path)
+
+    # FAISS import
     try:
-        import faiss  # noqa
+        import faiss  # noqa: F401
     except Exception as e:
         raise RuntimeError(
-            "FAISS failed to import. On Windows, run backend in WSL2/Linux or use conda faiss-cpu. "
+            "FAISS failed to import. Render runs Linux, so faiss-cpu is usually fine via pip. "
+            "Ensure your requirements.txt includes faiss-cpu.\n"
             f"Original error: {e}"
         )
     import faiss
-    faiss_index = faiss.read_index(os.path.join(ART_DIR, "faiss_stage1.index"))
+    faiss_index = faiss.read_index(faiss_path)
 
+    # Sanity check alignment
     n = len(df)
-    if X_audio.shape[0] != n or X_meta.shape[0] != n or X_stage1.shape[0] != n or X_lyrics.shape[0] != n:
+    if (
+        X_audio.shape[0] != n
+        or X_meta.shape[0] != n
+        or X_stage1.shape[0] != n
+        or X_lyrics.shape[0] != n
+    ):
         raise RuntimeError("Artifact row mismatch: df and matrices are not aligned.")
 
 # ---------------- Schemas ----------------
 class RecommendRequest(BaseModel):
-    seed_id: int
+    seed_id: int = Field(..., description="Row index of the seed song in df")
     w_audio: float = 0.4
     w_lyrics: float = 0.4
     w_meta: float = 0.2
@@ -110,14 +153,22 @@ class RecommendRequest(BaseModel):
     top_k: int = 10
     k_candidates: int = 2000
 
-    # FORCE: only these two values
+    # only these two values
     artist_mode: str = "different"  # "same" or "different"
 
 # ---------------- Startup ----------------
 @app.on_event("startup")
 def on_startup():
-    ensure_loaded()
-    print(f"✅ Loaded artifacts from {ART_DIR}: rows={len(df)} stage1_dim={X_stage1.shape[1]}")
+    if EAGER_LOAD:
+        try:
+            ensure_loaded()
+            print(f"✅ Loaded artifacts from {ART_DIR}: rows={len(df)} stage1_dim={X_stage1.shape[1]}")
+        except Exception as e:
+            # Don't crash the process if you prefer; but in production it's often better to fail fast.
+            # Here we choose fail-fast because a broken backend should be obvious on deploy.
+            raise
+    else:
+        print("ℹ️ MUSICOPHILE_EAGER_LOAD is false; artifacts will be loaded on first request.")
 
 # ---------------- Routes ----------------
 @app.get("/health")
@@ -129,6 +180,7 @@ def health():
         "rows": 0 if df is None else int(len(df)),
         "artifacts_dir": ART_DIR,
         "meta": meta_info,
+        "eager_load": EAGER_LOAD,
     }
 
 @app.get("/search")
@@ -138,7 +190,12 @@ def search(
     q: str = Query("", min_length=0),
     n: int = 20,
 ):
-    ensure_loaded()
+    # Lazy-load if needed
+    try:
+        ensure_loaded()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     if df is None:
         return {"results": []}
 
@@ -218,19 +275,22 @@ def search(
 
 @app.post("/recommend")
 def recommend(req: RecommendRequest):
-    ensure_loaded()
+    try:
+        ensure_loaded()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     if df is None:
-        return {"error": "dataset not loaded"}
+        raise HTTPException(status_code=500, detail="dataset not loaded")
 
-    n = len(df)
+    n_rows = len(df)
     seed_idx = int(req.seed_id)
-    if seed_idx < 0 or seed_idx >= n:
-        return {"error": "seed_id out of range"}
+    if seed_idx < 0 or seed_idx >= n_rows:
+        raise HTTPException(status_code=400, detail="seed_id out of range")
 
-    # enforce allowed values
     artist_mode = str(req.artist_mode).lower().strip()
     if artist_mode not in ("same", "different"):
-        return {"error": "artist_mode must be 'same' or 'different'"}
+        raise HTTPException(status_code=400, detail="artist_mode must be 'same' or 'different'")
 
     s = float(req.w_audio + req.w_lyrics + req.w_meta)
     if s <= 0:
@@ -241,18 +301,18 @@ def recommend(req: RecommendRequest):
     # -------- Stage 1: FAISS candidates --------
     k_cand = int(req.k_candidates)
     k_cand = max(k_cand, int(req.top_k) + 50)
-    k_cand = min(k_cand, n)
+    k_cand = min(k_cand, n_rows)
 
     seed_vec = np.asarray(X_stage1[seed_idx], dtype=np.float32).reshape(1, -1)
     D, I = faiss_index.search(seed_vec, k_cand)
     cand = I.ravel().astype(int)
 
-    cand = cand[(cand >= 0) & (cand < n)]
+    cand = cand[(cand >= 0) & (cand < n_rows)]
     cand = cand[cand != seed_idx]
     if cand.size == 0:
-        return {"error": "no candidates found"}
+        raise HTTPException(status_code=404, detail="no candidates found")
 
-    # -------- Artist filter (mandatory now) --------
+    # -------- Artist filter (mandatory) --------
     seed_artist = str(df.at[seed_idx, "artist"])
     if artist_mode == "same":
         cand = cand[df.loc[cand, "artist"].astype(str).values == seed_artist]
@@ -260,12 +320,13 @@ def recommend(req: RecommendRequest):
         cand = cand[df.loc[cand, "artist"].astype(str).values != seed_artist]
 
     if cand.size == 0:
-        return {"error": "no candidates after artist filter"}
+        raise HTTPException(status_code=404, detail="no candidates after artist filter")
 
     # -------- Stage 2: rerank --------
     seed_audio = np.asarray(X_audio[seed_idx], dtype=np.float32)
     seed_meta = np.asarray(X_meta[seed_idx], dtype=np.float32)
 
+    # Because vectors are normalized, dot product = cosine similarity
     audio_sim = np.asarray(X_audio[cand] @ seed_audio, dtype=np.float32)
     meta_sim = np.asarray(X_meta[cand] @ seed_meta, dtype=np.float32)
 
