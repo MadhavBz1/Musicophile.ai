@@ -17,3 +17,10 @@ musicophile-mobile/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Large artifacts / datasets
+backend/artifacts/
+*.npy
+*.npz
+*.parquet
+*.index
