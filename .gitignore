@@ -1,0 +1,19 @@
+# Virtual env
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets
+.env
+
+# Musicophile Mobile
+musicophile-mobile/
+
+# Jupyter
+.ipynb_checkpoints/
