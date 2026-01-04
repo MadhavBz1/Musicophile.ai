@@ -14,7 +14,7 @@
     "production": {
       "distribution": "store",
       "node": "20.19.4",
-      "autoIncrement": "buildNumber",
+      "autoIncrement": true,
       "ios": {
         "image": "macos-sonoma-14.6-xcode-16.1"
       }
