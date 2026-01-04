@@ -12,8 +12,10 @@
       "distribution": "internal"
     },
     "production": {
-      "distribution": "store",
-      "node": "20.19.4"
+       "distribution": "store",
+        "node": "20.19.4",
+        "ios": {
+        "image": "macos-sonoma-15.4-xcode-16.2"
     }
   },
   "submit": {
