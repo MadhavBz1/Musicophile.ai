@@ -15,7 +15,7 @@
       "distribution": "store",
       "node": "20.19.4",
       "ios": {
-        "image": "macos-sonoma-15.4-xcode-16.2"
+        "image": "macos-sonoma-14.6-xcode-16.1"
       }
     }
   },
