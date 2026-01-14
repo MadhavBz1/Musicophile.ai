@@ -44,4 +44,5 @@ For general inquiries, please email:
 
 ## App Availability
 
-musicophile.ai is available through Apple TestFlight and will be released on the App Store.
+musicophile.ai is available through Apple TestFlight and will be released on the App Store. follow this link: https://apps.apple.com/ca/app/musicophile-ai/id6757350424
+
